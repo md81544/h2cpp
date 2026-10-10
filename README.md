@@ -1,3 +1,4 @@
+```
 Writes stub definitions for every function declared in a C++ header.
 Non-void functions return a value-initialised result ({}), or a
 reference to a static default object for reference return types.
@@ -10,3 +11,4 @@ Options:
   -i, --ignore MACRO      treat MACRO (and any (...) after it) as noise,
                           e.g. -i MYLIB_EXPORT; may be repeated
   -h, --help              show this help
+```
