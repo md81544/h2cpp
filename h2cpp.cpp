@@ -381,8 +381,10 @@ std::vector<Tokens> splitParams(const Tokens& t)
     return parts;
 }
 
-// Parameter types with names removed, so "int x" matches "int".
-std::string paramKey(const std::vector<Tokens>& params)
+// Index of the parameter's name within its tokens, if it has one:
+// "int x" -> x, "const T& v" -> v, "char buf[16]" -> buf,
+// "void (*cb)(int)" -> cb; "int", "const T&", "..." -> none.
+std::optional<size_t> paramNameIndex(const Tokens& p)
 {
     static const std::set<std::string_view> builtin
         = { "int",  "char", "short",   "long",    "unsigned", "signed",   "float", "double",
@@ -390,17 +392,75 @@ std::string paramKey(const std::vector<Tokens>& params)
     static const std::set<std::string_view> notAType
         = { "const", "volatile", "struct", "class", "enum", "union", "typename", "::" };
 
+    // Function pointer / reference: "R (*name)(args)", "R (C::*name)(args)".
+    for (size_t k = 0; k + 2 < p.size(); ++k) {
+        if (p[k].text != "(") {
+            continue;
+        }
+        size_t j = k + 1;
+        while (j + 1 < p.size() && isIdent(p[j].text) && p[j + 1].text == "::") {
+            j += 2;
+        }
+        if (j < p.size() && (p[j].text == "*" || p[j].text == "&" || p[j].text == "&&")) {
+            ++j;
+            while (j < p.size() && (p[j].text == "const" || p[j].text == "volatile")) {
+                ++j;
+            }
+            if (j < p.size() && isIdent(p[j].text)) {
+                return j;
+            }
+            return std::nullopt;
+        }
+    }
+
+    // Skip trailing array bounds: "buf[16]", "grid[3][3]".
+    size_t end = p.size();
+    while (end > 0 && p[end - 1].text == "]") {
+        int depth = 0;
+        while (end > 0) {
+            const std::string& s = p[--end].text;
+            if (s == "]") {
+                ++depth;
+            } else if (s == "[" && --depth == 0) {
+                break;
+            }
+        }
+    }
+
+    if (end < 2) {
+        return std::nullopt;
+    }
+    const std::string& last = p[end - 1].text;
+    const std::string& prev = p[end - 2].text;
+    const bool prevIsType
+        = isIdent(prev) || prev == "*" || prev == "&" || prev == "&&" || prev == ">";
+    if (!isIdent(last) || builtin.contains(last) || notAType.contains(last)) {
+        return std::nullopt;
+    }
+
+    // cv after something ("T* const name", "int const name") means a name
+    // follows; cv with nothing before it ("const Foo") qualifies the type.
+    if (prev == "const" || prev == "volatile") {
+        size_t j = end - 2;
+        while (j > 0 && (p[j].text == "const" || p[j].text == "volatile")) {
+            --j;
+        }
+        const bool cvOnly = p[j].text == "const" || p[j].text == "volatile";
+        return cvOnly ? std::nullopt : std::optional<size_t>(end - 1);
+    }
+    if (!notAType.contains(prev) && prevIsType) {
+        return end - 1;
+    }
+    return std::nullopt;
+}
+
+// Parameter types with names removed, so "int x" matches "int".
+std::string paramKey(const std::vector<Tokens>& params)
+{
     std::string key;
     for (Tokens p : params) {
-        if (p.size() >= 2) {
-            const std::string& last = p.back().text;
-            const std::string& prev = p[p.size() - 2].text;
-            const bool prevIsType
-                = isIdent(prev) || prev == "*" || prev == "&" || prev == "&&" || prev == ">";
-            if (isIdent(last) && !builtin.contains(last) && !notAType.contains(prev)
-                && prevIsType) {
-                p.pop_back();
-            }
+        if (const auto idx = paramNameIndex(p)) {
+            p.erase(p.begin() + *idx);
         }
         key += (key.empty() ? "" : ",") + compact(p);
     }
@@ -1087,18 +1147,26 @@ void Parser::buildStub(const Tokens& st)
         head += std::format("{}({}){}", name, params, quals);
     }
 
-    std::string body;
+    // Silence unused-parameter warnings inside the stub itself, so the
+    // suppression goes away when the body is replaced.
+    std::string body = "    // TODO (auto-generated stub)\n";
+    for (const auto& p : sig->params) {
+        if (const auto idx = paramNameIndex(p)) {
+            body += std::format("    (void){}; // TODO - remove\n", p[*idx].text);
+        }
+    }
+
     if (!retType.empty() && retText != "void") {
         const std::string& last = retType.back().text;
         if (last == "&" || last == "&&") {
-            body = std::format(
+            body += std::format(
                 "    static {} stub_return_value_{{}};\n",
                 join(slice(retType, 0, retType.size() - 1)));
             body += (last == "&")
                 ? "    return stub_return_value_;\n"
                 : std::format("    return static_cast<{}>(stub_return_value_);\n", retText);
         } else {
-            body = "    return {};\n";
+            body += "    return {};\n";
         }
     }
 
@@ -1187,11 +1255,7 @@ std::string freshFile(const Options& opt, const std::vector<Item>& items)
 {
     std::string out = std::format(
         "// Stub implementations generated by h2cpp from {0}\n"
-        "#include \"{0}\"\n"
-        "\n"
-        "#if defined(__GNUC__) || defined(__clang__)\n"
-        "#pragma GCC diagnostic ignored \"-Wunused-parameter\"\n"
-        "#endif\n",
+        "#include \"{0}\"\n",
         baseName(opt.header));
     std::vector<const Item*> all;
     for (const auto& item : items) {
