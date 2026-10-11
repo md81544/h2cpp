@@ -639,8 +639,14 @@ std::expected<Signature, std::string> analyse(const Tokens& st, Mode mode, bool 
         if (s == ":" || s == "try") {
             break; // ctor init list (Source)
         }
-        if (s == "=") {
-            return unexpected(""); // = 0 / default / delete
+        if (s == "=") { // = 0 / default / delete
+            // In a .cpp, "X::~X() = default;" is a definition in its own right.
+            const bool defaulted
+                = k + 1 < st.size() && (st[k + 1].text == "default" || st[k + 1].text == "delete");
+            if (mode == Mode::Source && defaulted) {
+                break;
+            }
+            return unexpected("");
         }
         if (s == "->" && !sig.hasTrailing) {
             sig.hasTrailing = true;
@@ -980,7 +986,17 @@ void Parser::recordNestedType(Scope& sc, const Tokens& st)
 
 void Parser::handleStatement(const Tokens& st)
 {
-    if (st.empty() || mode_ == Mode::Source) {
+    if (st.empty()) {
+        return;
+    }
+    if (mode_ == Mode::Source) {
+        // Only "= default;" / "= delete;" definitions end in ';' - plain
+        // declarations (forward declarations, prototypes) don't count.
+        const bool defaulted = st.size() >= 3 && st[st.size() - 2].text == "="
+            && (st.back().text == "default" || st.back().text == "delete");
+        if (defaulted) {
+            recordDefinition(st, i_ - 1); // i_ - 1 is the ';'
+        }
         return;
     }
     Scope& cur = scopes_.back();
