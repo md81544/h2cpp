@@ -705,6 +705,7 @@ struct Definition {
 struct Options {
     std::string header, output;
     bool trailingReturn = false;
+    bool dryRun = false;
     std::set<std::string, std::less<>> ignoreMacros;
 };
 
@@ -1318,9 +1319,16 @@ findDefinition(const std::vector<Item>& items, const Item& h, const std::vector<
     return nullptr;
 }
 
+// One block of stubs inserted at a single point (used for --dry-run).
+struct Insertion {
+    size_t line = 0; // 1-based line in the original file it goes before; 0 = end
+    std::string text;
+};
+
 struct MergeResult {
     std::string text;
     size_t added = 0;
+    std::vector<Insertion> insertions; // in file order
 };
 
 // Inserts stubs for header functions missing from `src`, each placed after
@@ -1388,10 +1396,18 @@ merge(std::string src, const std::vector<Item>& items, const std::vector<Definit
     // Insert back to front so earlier offsets stay valid; for equal offsets
     // the later group goes in first, leaving header order intact.
     std::ranges::stable_sort(groups, {}, &Group::pos);
-    for (const auto& g : groups | std::views::reverse) {
-        src.insert(g.pos, renderItems(g.items, g.base));
+
+    std::vector<Insertion> insertions;
+    for (const auto& g : groups) {
+        const size_t line = g.pos >= src.size()
+            ? 0
+            : static_cast<size_t>(std::ranges::count(src.begin(), src.begin() + g.pos, '\n')) + 1;
+        insertions.push_back({ line, renderItems(g.items, g.base) });
     }
-    return { std::move(src), added };
+    for (size_t k = groups.size(); k-- > 0;) {
+        src.insert(groups[k].pos, insertions[k].text);
+    }
+    return { std::move(src), added, std::move(insertions) };
 }
 
 // ------------------------------------------------------------------ main ---
@@ -1409,6 +1425,8 @@ void printUsage(std::FILE* f)
         "Options:\n"
         "  -o, --output FILE       write to FILE instead of stdout. If FILE exists,\n"
         "                          only stubs it lacks are added, in header order\n"
+        "  -d, --dry-run           with -o, change nothing: print to stdout what\n"
+        "                          would be written or added, and where\n"
         "  -t, --trailing-return   use 'auto f() -> T' for every member function\n"
         "                          (helps when return types are inherited nested types)\n"
         "  -i, --ignore MACRO      treat MACRO (and any (...) after it) as noise,\n"
@@ -1475,6 +1493,8 @@ std::optional<int> parseArgs(std::span<char* const> args, Options& opt)
             opt.output = arg.substr(9);
         } else if (arg == "-t" || arg == "--trailing-return") {
             opt.trailingReturn = true;
+        } else if (arg == "-d" || arg == "--dry-run") {
+            opt.dryRun = true;
         } else if (arg == "-i" || arg == "--ignore") {
             const auto v = value();
             if (!v) {
@@ -1491,6 +1511,9 @@ std::optional<int> parseArgs(std::span<char* const> args, Options& opt)
     }
     if (opt.header.empty()) {
         return fail("no header file given");
+    }
+    if (opt.dryRun && opt.output.empty()) {
+        return fail("--dry-run only makes sense with --output");
     }
     return std::nullopt;
 }
@@ -1561,6 +1584,12 @@ int main(int argc, char* argv[])
     }
 
     if (!fs::exists(out)) {
+        if (opt.dryRun) {
+            std::print("{}", freshFile(opt, items));
+            std::println(
+                stderr, "h2cpp: dry run: would create {} with {} stub(s)", opt.output, stubCount);
+            return 0;
+        }
         if (!writeFile(out, freshFile(opt, items))) {
             std::println(stderr, "h2cpp: cannot write {}", opt.output);
             return 1;
@@ -1575,9 +1604,20 @@ int main(int argc, char* argv[])
         return 1;
     }
     const Parser source(*existing, Mode::Source, opt);
-    auto [text, added] = merge(*existing, items, source.definitions());
+    auto [text, added, insertions] = merge(*existing, items, source.definitions());
     if (added == 0) {
         std::println(stderr, "h2cpp: {} is up to date", opt.output);
+        return 0;
+    }
+    if (opt.dryRun) {
+        for (const auto& ins : insertions) {
+            const std::string where = ins.line == 0
+                ? std::string("at end of")
+                : std::format("before line {} of", ins.line);
+            std::print(
+                "// ---- h2cpp: would insert {} {} ----\n{}\n", where, opt.output, ins.text);
+        }
+        std::println(stderr, "h2cpp: dry run: would add {} stub(s) to {}", added, opt.output);
         return 0;
     }
     if (!writeFile(out, text)) {
